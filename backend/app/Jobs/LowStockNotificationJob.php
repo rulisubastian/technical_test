@@ -1,0 +1,4 @@
+<?php
+namespace App\Jobs;
+use App\Models\{Product,User};use Illuminate\Bus\Queueable;use Illuminate\Contracts\Queue\ShouldQueue;use Illuminate\Foundation\Bus\Dispatchable;use Illuminate\Queue\InteractsWithQueue;use Illuminate\Queue\SerializesModels;use Illuminate\Support\Facades\Mail;
+class LowStockNotificationJob implements ShouldQueue {use Dispatchable,InteractsWithQueue,Queueable,SerializesModels;public int $tries=3;public array $backoff=[10,30,60];public function __construct(public int $productId){}public function handle():void{$p=Product::find($this->productId);if(!$p||$p->stock >= $p->low_stock_threshold)return;foreach(User::where('role','admin')->get() as $admin){if($admin->email)Mail::raw("Low stock: {$p->product_name} ({$p->stock})",fn($m)=>$m->to($admin->email)->subject('Azatech low stock alert'));}}}

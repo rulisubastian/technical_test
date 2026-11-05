@@ -1,0 +1,4 @@
+<?php
+namespace App\Jobs;
+use App\Models\Order;use Illuminate\Bus\Queueable;use Illuminate\Contracts\Queue\ShouldQueue;use Illuminate\Foundation\Bus\Dispatchable;use Illuminate\Queue\InteractsWithQueue;use Illuminate\Queue\SerializesModels;use Illuminate\Support\Facades\Storage;use Illuminate\Support\Facades\Mail;
+class GenerateInvoiceJob implements ShouldQueue {use Dispatchable,InteractsWithQueue,Queueable,SerializesModels;public int $tries=3;public array $backoff=[10,30,60];public function __construct(public int $orderId){}public function handle():void{$o=Order::with('items.product','customer')->findOrFail($this->orderId);$html=view('invoice',compact('o'))->render();Storage::disk('local')->put("invoices/{$o->id}.html",$html);$email=$o->customer?->email;if($email)Mail::html($html,fn($m)=>$m->to($email)->subject("Invoice {$o->order_number}"));}}

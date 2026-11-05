@@ -1,0 +1,1 @@
+import {describe,it,expect} from 'vitest';describe('order total',()=>{it('calculates total from qty and unit price',()=>{const items=[{qty:2,price:12000},{qty:1,price:5000}];expect(items.reduce((s,x)=>s+x.qty*x.price,0)).toBe(29000)})})

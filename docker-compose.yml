@@ -1,0 +1,50 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: azatech
+      POSTGRES_USER: azatech
+      POSTGRES_PASSWORD: secret
+    ports: ["5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U azatech -d azatech"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck: {test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 10}
+
+  api:
+    build: ./backend
+    env_file: ./backend/.env
+    ports: ["8000:8000"]
+    depends_on: 
+      db: {condition: service_healthy}
+      redis: {condition: service_healthy}
+    volumes:
+      - ./backend:/var/www/html
+    command: sh -c "php artisan serve --host=0.0.0.0 --port=8000"
+
+  worker:
+    build: ./backend
+    env_file: ./backend/.env
+    depends_on: 
+      api: {condition: service_started}
+    volumes:
+      - ./backend:/var/www/html
+    command: php artisan queue:work redis --sleep=1 --tries=3 --backoff=10 --timeout=120
+
+  web:
+    build: ./frontend
+    environment: {NUXT_PUBLIC_API_BASE: http://localhost:8000/api}
+    ports: ["3000:3000"]
+    depends_on: [api]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["8025:8025", "1025:1025"]
+
+volumes: {pgdata: {}}
