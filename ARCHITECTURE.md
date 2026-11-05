@@ -47,21 +47,56 @@ Sebelum mengirimkan dokumen ini, jawab pertanyaan berikut dengan kalimat Anda se
 3. Sebutkan satu *bug* nyata yang ditemukan saat implementasi dan bagaimana Anda mendiagnosisnya.
 4. Apa saja area yang masih belum lengkap/lemah dan apa langkah konkret selanjutnya untuk memperbaikinya?
 
+# Arsitektur Proyek: azatech-order-management
 ## JAWABAN
-1. A. Cara Implementasi: Proses pengurangan stok dijalankan di dalam sebuah transaksi   database (DB::transaction). Baris data produk yang sedang diproses dikunci terlebih dahulu menggunakan lockForUpdate() setelah diurutkan berdasarkan Product ID (untuk menghindari risiko deadlock). Sistem kemudian melakukan validasi jumlah kuantitas stok yang tersedia di memori database yang telah dikunci tersebut sebelum memproses pengurangan kuantitas, serta menulis riwayat perubahan pada tabel ledger stok dalam transaksi yang sama.
-B. File/Fungsi Terkait: StockService atau OrderService (pada bagian pemrosesan pesanan), serta berkas dokumen kebijakan konsistensi stok ADR-001 — Stock consistency
 
-2. Struktur folder dipisahkan ke dalam beberapa lapisan abstrak (seperti HTTP Layer, Application/Domain Layer, Persistence Layer, dan Async Layer) untuk memisahkan tanggung jawab kode (Separation of Concerns) dan menjaga agar logika bisnis inti tidak tercampur dengan urusan infrastruktur atau presentasi.
-A. Alasan Pemilihan: Lapisan HTTP hanya mengurusi routing, middleware, dan controller. Logika bisnis inti diisolasi ke dalam layanan mandiri seperti OrderService, OrderStateMachine, dan StockService. Pemisahan ini dipilih agar kode memiliki tingkat keterbacaan yang tinggi, mudah diuji secara modular (menggunakan unit testing), serta mencegah ketergantungan yang berlebihan antar komponen.
-B. Rencana Pengembangan ke Depan: Menuju skala yang lebih besar (target 50.000 pesanan/hari dan multi-cabang), struktur ini direncanakan untuk berevolusi dengan menerapkan partisi data per cabang (tenant/branch isolation), mengenalkan tabel reservasi inventaris khusus, menggunakan Outbox Pattern untuk pengiriman event asinkron yang andal, pemisahan read/write replica database, serta horizontal scaling untuk API dan queue workers.
+Dokumen ini menjelaskan struktur lapisan sistem, strategi penanganan konkurensi data inventaris, dan cetak biru (roadmap) pengembangan sistem ke depan.
 
-3. Salah satu bug nyata yang ditemukan saat implementasi adalah terjadinya gangguan interkoneksi atau kesalahan konfigurasi driver saat sistem mencoba menghubungkan komponen asinkron/antrean, yang memicu warning kegagalan muat ekpensi eksternal.
-A. Deskripsi Bug: Kegagalan sistem saat memuat library ekstensi Redis pada PHP startup runtime, ditandai dengan pesan error: Warning: PHP Startup: Unable to load dynamic library 'redis' (tried: ext\redis... The specified module could not be found).
-B. Cara Diagnosis: Masalah ini didiagnosis dengan memeriksa log startup container/server dan berkas lingkungan konfigurasi. Akar masalahnya ditemukan pada lingkungan Dockerfile berbasis alpine (atau PHP CLI lokal) di mana ekstensi php-redis belum terkompilasi/terpasang dengan benar di dalam konfigurasi php.ini, atau file .dll/.so yang dibutuhkan tidak berada di direktori ekstensi PHP yang tepat saat aplikasi Laravel dinyalakan.
+## 1. Pemisahan Lapisan Sistem (Layers Separation)
 
-4. Area yang saat ini diidentifikasi masih lemah adalah arsitektur autentikasi untuk deployment produksi berskala besar serta skalabilitas pemrosesan data antrean.
-A. Kelemahan saat Ini: Penggunaan Sanctum bearer tokens yang disimpan di sisi klien (frontend Nuxt) saat ini masih memiliki keterbatasan keamanan dan fungsionalitas jika harus mengelola topologi multi-cabang yang masif. Selain itu, pemrosesan antrean asinkron untuk notifikasi stok dan pembuatan invoice belum dipisahkan secara murni berdasarkan beban kerja.
-B. Langkah Konkret Perbaikan:
+Sistem backend dibangun di atas kerangka kerja Laravel dengan mengadopsi prinsip *Separation of Concerns* (SoC) untuk memisahkan tanggung jawab kode secara tegas:
+
+*   **HTTP Layer:** 
+    *   *Tanggung Jawab:* Menangani siklus *request-response* API publik, menyaring akses, dan memvalidasi struktur data mentah.
+    *   *Komponen Utama:* Rute API (`routes/api.php`), Middleware (`RequestId.php`), Form Requests, serta Controllers seperti `Http/Controllers/Api/OrderController.php` dan `ProductController.php`. Lapisan ini dilarang keras memuat logika manipulasi database langsung.
+*   **Application / Domain Layer:** 
+    *   *Tanggung Jawab:* Menjadi pusat eksekusi seluruh aturan bisnis inti (*business invariants*) dan mutasi status data tanpa terikat pada protokol HTTP.
+    *   *Komponen Utama:* Kelas layanan mandiri seperti `app/Services/OrderService.php`, `app/Services/StockService.php`, dan logika State Machine transisi order (`app/Domain/Order/OrderStateMachine.php`).
+*   **Persistence Layer:** 
+    *   *Tanggung Jawab:* Mengelola representasi, penyimpanan, indeksasi, dan integritas data pada PostgreSQL.
+    *   *Komponen Utama:* Model Eloquent (`app/Models/Order.php`, `Product.php`, `StockMovement.php`), Skema Migrasi (`database/migrations/2026_01_01_000000_create_core_tables.php`), serta Seeders (`database/seeders/DatabaseSeeder.php`).
+*   **Async / Event Layer:** 
+    *   *Tanggung Jawab:* Memproses tugas-tugas dengan komputasi berat secara asinkron di latar belakang menggunakan worker antrean berbasis Redis untuk menjaga latensi API tetap rendah.
+    *   *Komponen Utama:* `app/Jobs/GenerateInvoiceJob.php`, `app/Jobs/ProcessPaidOrder.php`, dan `app/Jobs/LowStockNotificationJob.php`.
+
+---
+
+## 2. Strategi Konsistensi Stok Konkuren (Concurrent Stock Strategy)
+
+Sistem mencegah terjadinya kondisi balapan (*race condition*) dan stok bernilai negatif (*overselling*) saat menerima banyak permintaan pesanan bersamaan dengan menerapkan **Pessimistic Row Locking** langsung di tingkat database.
+
+### Alur Eksekusi & Batasan Transaksi (Transaction Boundary)
+Seluruh rangkaian operasi pemeriksaan stok, pengurangan kuantitas, hingga penulisan log mutasi wajib dibungkus di dalam satu batasan transaksi database murni (`DB::transaction`).
+
+1.  **Deadlock Prevention:**ID Produk yang diminta diurutkan terlebih dahulu secara merangkak naik (*ascending*) sebelum kueri dijalankan. Hal ini krusial untuk mencegah *deadlock* silang antar transaksi konkuren.
+2.  **Row Locking:** Baris data produk dikunci menggunakan klausa `lockForUpdate()` milik Eloquent. Transaksi konkuren lain yang mencoba mengakses produk yang sama akan ditahan di antrean database sampai transaksi saat ini melakukan komit (`commit`) atau pembatalan (`rollback`).
+3.  **Invariant Validation:** Setelah baris dikunci, sisa kuantitas stok aktual dibaca dari memori database yang aman. Jika stok kurang dari permintaan, sistem melempar `InsufficientStockException` yang otomatis memicu *rollback* transaksi demi menjaga atomisitas.
+
+---
+
+## 3. Rencana Peta Jalan Skalabilitas (Roadmap to 50k Orders/Day)
+
+Untuk mendukung pertumbuhan transaksi masif dan arsitektur multi-cabang (multi-tenant), arsitektur backend akan dikembangkan melalui langkah-langkah konkret berikut:
+
+1.  **Pemisahan Infrastruktur Database (Read/Write Split):** Mengonfigurasi lapisan persistensi Laravel untuk mengarahkan operasi tulis dan penguncian (`lockForUpdate`) ke database *PostgreSQL Master*, serta mengarahkan kueri baca/dashboard ke *PostgreSQL Read Replica*.
+2.  **Pool Antrean Khusus (Dedicated Queue Pools):** Memisahkan pemicuan worker antrean asinkron berdasarkan prioritas beban kerja (`php artisan queue:work --queue=high,default,low`) untuk memastikan `ProcessPaidOrder` tidak terhambat oleh proses pencetakan dokumen lambat pada `GenerateInvoiceJob`.
+3.  **Tabel Reservasi Inventaris (Inventory Reservations):** Mengganti skema penguncian langsung pada baris tabel produk utama dengan tabel reservasi inventaris terpisah, guna meningkatkan *throughput* transaksi pada produk-produk populer (*hot products*).
+
+## 4 Apa saja area yang masih belum lengkap/lemah dan apa langkah konkret selanjutnya untuk memperbaikinya?
+
+1. Area yang saat ini diidentifikasi masih lemah adalah arsitektur autentikasi untuk deployment produksi berskala besar serta skalabilitas pemrosesan data antrean.
+A. **Kelemahan saat Ini:** Penggunaan *Sanctum bearer tokens* yang disimpan di sisi klien (frontend Nuxt) saat ini masih memiliki keterbatasan keamanan dan fungsionalitas jika harus mengelola topologi multi-cabang yang masif. Selain itu, pemrosesan antrean asinkron untuk notifikasi stok dan pembuatan invoice belum dipisahkan secara murni berdasarkan beban kerja.
+B. **Langkah Konkret Perbaikan:**
 	1. Mengubah arsitektur autentikasi pada deployment produksi menggunakan HttpOnly cookie-based session architecture yang lebih aman untuk aplikasi berbasis browser seperti Nuxt.
-	2. Memisahkan kolam antrean (dedicated queue pools) secara khusus untuk memisahkan beban kerja kritis (seperti pemrosesan pesanan/stok) dengan beban kerja sekunder (notifikasi/email).
-	3. Mengimplementasikan OpenTelemetry tracing untuk memantau performa latensi dan hambatan (bottleneck) di sepanjang alur transaksi dari Nuxt menuju Laravel API hingga PostgreSQL dan Redis.
+	2. **Memisahkan kolam antrean (dedicated queue pools)** secara khusus untuk memisahkan beban kerja kritis (seperti pemrosesan pesanan/stok) dengan beban kerja sekunder (notifikasi/email).
+	3. **Mengimplementasikan OpenTelemetry tracing** untuk memantau performa latensi dan hambatan (bottleneck) di sepanjang alur transaksi dari Nuxt menuju Laravel API hingga PostgreSQL dan Redis.
